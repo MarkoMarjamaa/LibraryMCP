@@ -1,0 +1,86 @@
+# ---------------------------------------------------------------------------
+# Library configuration
+#
+# A "shelf" is a named collection backed by one directory. A shelf "type"
+# decides how that directory is interpreted at ingest time:
+#
+#   manuals     source_dir (the immediate parent folder) is the device
+#               name + model. Used as the document title.
+#
+#   meetings    source_dir is the meeting date. Parsed into doc_date so
+#               date_from / date_to / dates filters work.
+#
+#   scientific  files are named by paper ID (arXiv ID or DOI). Title,
+#               authors, year and abstract are resolved over the network,
+#               falling back to first-page extraction.
+#
+# Several shelves may share a type. Add a new shelf by appending here and
+# restarting the watcher; the shelves table is reconciled on startup.
+# ---------------------------------------------------------------------------
+
+database:
+  dsn: "postgresql://librarian:librarian@localhost:5432/library"
+  min_pool: 2
+  max_pool: 10
+
+embedding:
+  # An HTTP embedding server keeps the model out of both processes, so neither
+  # the watcher nor the MCP server holds the weights and there is no
+  # duplication.
+  #
+  # backend: "openai" -> POST /v1/embeddings   (llama.cpp, TEI, vLLM, LM Studio)
+  # backend: "ollama" -> POST /api/embed       (Ollama only)
+  backend: "openai"
+  base_url: "http://localhost:8081"
+  model: "bge-m3"
+  dimensions: 1024          # must match vector(N) in the schema
+  # Keep this modest: llama-server must fit the whole batch inside one
+  # physical batch (--ubatch-size), and long manual chunks add up fast.
+  batch_size: 8
+  timeout: 120.0
+  # api_key: "..."          # only if your server requires one
+
+  # --- Ollama instead ---
+  # backend: "ollama"
+  # base_url: "http://localhost:11434"
+  # batch_size: 16
+
+chunking:
+  target_tokens: 400
+  overlap_tokens: 60
+  min_tokens: 40            # discard fragments smaller than this
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+  path: "/mcp"
+
+watcher:
+  scan_interval_seconds: 300
+  # inotify picks up changes immediately, but does not work on NFS/SMB mounts.
+  # The periodic scan is the reliable path; treat this as an optimisation.
+  use_inotify: false
+  # Network lookups for the 'scientific' type. Turn off to run fully offline.
+  network_metadata: true
+  user_agent: "library-indexer/0.1 (mailto:you@example.com)"
+
+shelves:
+  - name: manuals
+    type: manuals
+    path: /srv/documents/manuals
+    # manuals/Shelly Plus 2PM/manual_v3.pdf  ->  device "Shelly Plus 2PM"
+
+  - name: work_meetings
+    type: meetings
+    path: /srv/documents/meetings/work
+    description: "Work meeting documents"
+
+  - name: condo_meetings
+    type: meetings
+    path: /srv/documents/meetings/condo
+    description: "Housing company meeting documents"
+
+  - name: papers
+    type: scientific
+    path: /srv/documents/papers
+    description: "Scientific papers"
