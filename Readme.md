@@ -1,6 +1,8 @@
 # Library
 
 Local document RAG over Postgres + pgvector, exposed to a speech assistant via MCP.
+Need also llama.cpp or similar to process embeddings. 
+Quick'dirty, AS_SI, all local. 
 
 Two processes, one codebase:
 
@@ -129,4 +131,14 @@ Shelf types and what they do at ingest:
   a filename aloud.
 - Scanned PDFs with no text layer are skipped with an error. Run OCR
   (`ocrmypdf`) over them first.
+
+## Getting bge-m3 gguf
+```
+git clone llama.cpp
+# in your llama.cpp checkout, with current master
+pip install -r requirements.txt
+pip install huggingface_hub
+huggingface-cli download BAAI/bge-m3 --local-dir ./bge-m3
+python convert_hf_to_gguf.py ./bge-m3 --outtype f16 --outfile bge-m3-f16-new.gguf
+```
 
