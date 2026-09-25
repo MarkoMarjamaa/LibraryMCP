@@ -1,9 +1,10 @@
-"""Ingest pipeline: scan a shelf's directory, index new or changed PDFs."""
+"""Ingest pipeline: scan a shelf's directory, index new or changed documents."""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -12,12 +13,19 @@ import httpx
 from Config import Config, Shelf
 from Db import Database
 from Embed import Embedder, document_text_for
+import Extract as extractmod
+
+# Import order registers the extractors; Pdf last so the scientific helpers
+# sit alongside the format that still uses them most.
+import Docx  # noqa: F401  (.docx)
+import Ods  # noqa: F401    (.ods)
+import Pptx  # noqa: F401   (.pptx)
+import TextFiles  # noqa: F401 (.txt, .md)
+import Xlsx  # noqa: F401   (.xlsx, .xlsm)
 import Metadata as metamod
-import Pdf as pdfmod
+import Pdf as pdfmod  # noqa: F401  (.pdf)
 
 log = logging.getLogger(__name__)
-
-SUPPORTED_SUFFIXES = {".pdf"}
 
 
 @dataclass(slots=True)
@@ -61,16 +69,28 @@ class Indexer:
         seen: set[str] = set()
 
         for file in sorted(shelf.path.rglob("*")):
-            if not file.is_file() or file.suffix.lower() not in SUPPORTED_SUFFIXES:
+            if not file.is_file():
+                continue
+            extractor = extractmod.extract_for(file)
+            if extractor is None:
+                if extractmod.is_legacy_office(file):
+                    # Legacy .doc/.xls need an external converter; skipped
+                    # quietly rather than counted as a failure.
+                    log.debug("Skipping legacy Office file: %s", file)
                 continue
             if file.name.startswith("."):
                 continue
 
-            rel_path = str(file.relative_to(shelf.path.parent))
+            # Filenames with combining diacritics (NFD) hash and compare as
+            # different strings from their NFC form; normalise before the path
+            # goes anywhere near the database.
+            rel_path = unicodedata.normalize(
+                "NFC", str(file.relative_to(shelf.path.parent))
+            )
             seen.add(rel_path)
 
             try:
-                digest = await asyncio.to_thread(pdfmod.file_hash, file)
+                digest = await asyncio.to_thread(extractmod.file_hash, file)
             except OSError as exc:
                 log.warning("Cannot read %s: %s", file, exc)
                 result.failed += 1
@@ -82,13 +102,14 @@ class Indexer:
                 continue
 
             try:
-                await self._index_file(file, shelf, rel_path, digest)
+                await self._index_file(file, shelf, rel_path, digest, extractor)
                 result.indexed += 1
                 log.info("Indexed %s", rel_path)
             except Exception as exc:
                 result.failed += 1
-                log.warning("Failed to index %s: %s", rel_path, exc)
+                log.debug("Failed to index %s: %s", rel_path, exc)
                 continue
+                
 
         # Files that vanished from disk.
         stale = [doc_id for path, (doc_id, _) in known.items() if path not in seen]
@@ -99,9 +120,10 @@ class Indexer:
         return result
 
     async def _index_file(
-        self, file: Path, shelf: Shelf, rel_path: str, digest: str
+        self, file: Path, shelf: Shelf, rel_path: str, digest: str,
+        extractor: extractmod.Extractor,
     ) -> None:
-        pages = await asyncio.to_thread(pdfmod.extract_pages, file)
+        pages = await asyncio.to_thread(extractor.extract_pages, file)
         if not pages:
             #log.warning("Failed to index %s: %s", rel_path, "no extractable text (scanned PDF? try OCR first)")
             #return
@@ -114,7 +136,7 @@ class Indexer:
         meta = await metamod.resolve(file, shelf, source_dir, pages, self._http)
 
         chunks = await asyncio.to_thread(
-            pdfmod.chunk_pages, pages, self._config.chunking
+            extractmod.chunk_pages, pages, self._config.chunking
         )
         if not chunks:
             #log.warning("Failed to index %s: %s", rel_path, "produced no chunks")
@@ -159,7 +181,7 @@ class Indexer:
                 "summary_embedding": summary_vector,
                 "content_hash": digest,
                 "page_count": len(pages),
-                "extra": meta.extra,
+                "extra": {**meta.extra, "kind": extractor.kind},
             }
         )
 

@@ -1,8 +1,6 @@
 # Library
 
 Local document RAG over Postgres + pgvector, exposed to a speech assistant via MCP.
-Need also llama.cpp or similar to process embeddings. 
-Quick'dirty, AS_SI, all local. 
 
 Two processes, one codebase:
 
@@ -126,19 +124,17 @@ Shelf types and what they do at ingest:
 - Chunks are paragraph-packed to ~400 tokens with overlap, not split by page.
   `page_start`/`page_end` are recorded as provenance; `page_end > page_start`
   means the chunk crossed a break, and the citation reads "pages 6-7".
+- Supported formats beyond PDF: `.docx`, `.xlsx`/`.xlsm`, `.ods`, `.txt`,
+  `.md`/`.markdown`, `.pptx`. A "page" is the format's provenance unit:
+  worksheet (spreadsheets, sheet name kept in `section`), slide (pptx, with
+  speaker notes), form-feed page (txt/md), or one synthetic page (a docx
+  without explicit page breaks — cite `section`, not a page number).
+  `documents.extra.kind` records the format. Legacy `.doc`/`.xls` are skipped
+  (detected by OLE magic bytes, logged at debug); convert with LibreOffice
+  or export to PDF to index them.
 - Citations are returned as structured fields, not a formatted string, so the
   speech layer can say "page 12 of the Shelly Plus 2PM manual" without reading
   a filename aloud.
 - Scanned PDFs with no text layer are skipped with an error. Run OCR
   (`ocrmypdf`) over them first.
-
-## Getting bge-m3 gguf
-```
-git clone llama.cpp
-# in your llama.cpp checkout, with current master
-pip install -r requirements.txt
-pip install huggingface_hub
-huggingface-cli download BAAI/bge-m3 --local-dir ./bge-m3
-python convert_hf_to_gguf.py ./bge-m3 --outtype f16 --outfile bge-m3-f16-new.gguf
-```
 

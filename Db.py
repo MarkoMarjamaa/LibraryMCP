@@ -82,16 +82,30 @@ class Database:
         self._pool: asyncpg.Pool | None = None
 
     async def connect(self) -> None:
-        self._pool = await asyncpg.create_pool(
-            self._config.database.dsn,
-            min_size=self._config.database.min_pool,
-            max_size=self._config.database.max_pool,
-        )
+        if self._pool is None:
+            self._pool = await asyncpg.create_pool(
+                self._config.database.dsn,
+                min_size=self._config.database.min_pool,
+                max_size=self._config.database.max_pool,
+            )
 
     async def close(self) -> None:
         if self._pool is not None:
             await self._pool.close()
             self._pool = None
+
+    async def acquire_pool(self) -> asyncpg.Pool:
+        """The pool, (re)created if a previous teardown closed it.
+
+        Mirrors Embedder.client(): an mcp SDK that runs the lifespan per
+        session closes the pool when one session ends; the next tool call in
+        the still-running process then reconnects instead of failing.
+        asyncpg pools cannot be reopened, so this builds a fresh one.
+        """
+        if self._pool is None:
+            await self.connect()
+        assert self._pool is not None
+        return self._pool
 
     @property
     def pool(self) -> asyncpg.Pool:
@@ -105,7 +119,7 @@ class Database:
         """Reconcile the shelves table with config. Never deletes: removing a
         shelf from config leaves its documents queryable until you drop them
         explicitly."""
-        async with self.pool.acquire() as conn:
+        async with (await self.acquire_pool()).acquire() as conn:
             await conn.executemany(
                 """
                 INSERT INTO shelves (name, type, description, dir_meaning, root_path)
@@ -124,7 +138,7 @@ class Database:
             )
 
     async def list_shelves(self) -> list[dict[str, Any]]:
-        rows = await self.pool.fetch(
+        rows = await (await self.acquire_pool()).fetch(
             """
             SELECT s.name, s.type, s.description,
                    count(d.id)                       AS document_count,
@@ -142,7 +156,7 @@ class Database:
 
     async def get_document_state(self, shelf: str) -> dict[str, tuple[int, str | None]]:
         """rel_path -> (document_id, content_hash) for change detection."""
-        rows = await self.pool.fetch(
+        rows = await (await self.acquire_pool()).fetch(
             "SELECT id, rel_path, content_hash FROM documents WHERE shelf = $1",
             shelf,
         )
@@ -154,7 +168,7 @@ class Database:
         Chunks are deleted on update (ON DELETE CASCADE does not fire for an
         UPDATE, so this is explicit) because re-chunking invalidates them all.
         """
-        async with self.pool.acquire() as conn:
+        async with (await self.acquire_pool()).acquire() as conn:
             async with conn.transaction():
                 doc_id: int = await conn.fetchval(
                     """
@@ -192,7 +206,7 @@ class Database:
     async def insert_chunks(self, document_id: int, chunks: Sequence[dict[str, Any]]) -> None:
         if not chunks:
             return
-        await self.pool.executemany(
+        await (await self.acquire_pool()).executemany(
             """
             INSERT INTO chunks
                 (document_id, chunk_index, page_start, page_end, section,
@@ -211,7 +225,7 @@ class Database:
         if not document_ids:
             return 0
         return int(
-            await self.pool.fetchval(
+            await (await self.acquire_pool()).fetchval(
                 "WITH d AS (DELETE FROM documents WHERE id = ANY($1::bigint[]) RETURNING 1) "
                 "SELECT count(*) FROM d",
                 list(document_ids),
@@ -224,7 +238,7 @@ class Database:
         params: list[Any] = []
         where = filters.build(params)
         params.append(limit)
-        rows = await self.pool.fetch(
+        rows = await (await self.acquire_pool()).fetch(
             f"""
             SELECT d.id, d.shelf, d.title, d.source_dir, d.filename,
                    d.doc_date, d.year, d.authors, d.page_count,
@@ -249,7 +263,7 @@ class Database:
         params: list[Any] = [to_pgvector(embedding)]
         where = filters.build(params)
         params.append(limit)
-        rows = await self.pool.fetch(
+        rows = await (await self.acquire_pool()).fetch(
             f"""
             SELECT d.id, d.shelf, d.title, d.source_dir, d.filename,
                    d.doc_date, d.year, d.authors,
@@ -265,10 +279,24 @@ class Database:
         return [dict(r) for r in rows]
 
     async def get_document(self, document_id: int) -> dict[str, Any] | None:
-        row = await self.pool.fetchrow(
+        row = await (await self.acquire_pool()).fetchrow(
             "SELECT * FROM documents WHERE id = $1", document_id
         )
         return dict(row) if row else None
+
+    async def get_document_chunks(self, document_id: int) -> list[dict[str, Any]]:
+        """All chunks of a document, in reading order."""
+        rows = await (await self.acquire_pool()).fetch(
+            """
+            SELECT id AS chunk_id, chunk_index, content, section,
+                   page_start, page_end
+            FROM chunks
+            WHERE document_id = $1
+            ORDER BY chunk_index
+            """,
+            document_id,
+        )
+        return [dict(r) for r in rows]
 
     # -- retrieval ---------------------------------------------------------
 
@@ -290,7 +318,7 @@ class Database:
         arm_param = len(params) - 1
         limit_param = len(params)
 
-        rows = await self.pool.fetch(
+        rows = await (await self.acquire_pool()).fetch(
             f"""
             WITH vec AS (
                 SELECT c.id AS chunk_id,
@@ -339,7 +367,7 @@ class Database:
         self, chunk_id: int, before: int = 1, after: int = 1
     ) -> list[dict[str, Any]]:
         """Neighbouring chunks, for when a retrieved procedure is truncated."""
-        rows = await self.pool.fetch(
+        rows = await (await self.acquire_pool()).fetch(
             """
             WITH target AS (
                 SELECT document_id, chunk_index FROM chunks WHERE id = $1
@@ -360,4 +388,4 @@ class Database:
     async def notify_reindex(self, shelf: str | None) -> None:
         """Ask the watcher to rescan. Postgres LISTEN/NOTIFY avoids needing a
         queue or an HTTP endpoint between the two processes."""
-        await self.pool.execute("SELECT pg_notify($1, $2)", REINDEX_CHANNEL, shelf or "*")
+        await (await self.acquire_pool()).execute("SELECT pg_notify($1, $2)", REINDEX_CHANNEL, shelf or "*")

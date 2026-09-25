@@ -16,7 +16,7 @@ import sys
 from contextlib import asynccontextmanager
 from typing import Annotated, Any, AsyncIterator
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from pydantic import Field
 
 from Config import Config, load_config
@@ -31,7 +31,7 @@ _embedder: Embedder
 
 
 @asynccontextmanager
-async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
+async def lifespan(_server: MCPServer) -> AsyncIterator[None]:
     await _db.connect()
     await _db.sync_shelves(_config.shelves)
     log.info("Connected; shelves: %s", ", ".join(s.name for s in _config.shelves))
@@ -42,7 +42,7 @@ async def lifespan(_server: FastMCP) -> AsyncIterator[None]:
         await _db.close()
 
 
-mcp = FastMCP("library", lifespan=lifespan)
+mcp = MCPServer("library", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +307,60 @@ async def get_context(
 
 
 @mcp.tool()
+async def read_document(
+    document_id: Annotated[int, Field(description="document_id from search results or list_documents")],
+) -> dict[str, Any]:
+    """Read a whole document, top to bottom.
+
+    Use this instead of get_document_info when the answer may be anywhere in
+    the file: get_document_info returns only a short truncated summary, which
+    for long documents contains just the first section. Small files (meeting
+    notes, memos) return their full text; large ones return the text with a
+    character budget, continuing from where it stopped.
+    """
+    doc = await _db.get_document(document_id)
+    if doc is None:
+        return {"error": f"No document with id {document_id}"}
+    chunks = await _db.get_document_chunks(document_id)
+
+    budget = 24000  # ~6k tokens; keeps the reply usable but bounded
+    parts: list[str] = []
+    used = 0
+    covered = 0
+    for c in chunks:
+        covered += 1
+        if used >= budget:
+            break
+        parts.append(c["content"])
+        used += len(c["content"]) + 2
+
+    text = "\n\n".join(parts)
+    out: dict[str, Any] = {
+        "document_id": doc["id"],
+        "title": doc["title"],
+        "filename": doc["filename"],
+        "date": doc["doc_date"].isoformat() if doc["doc_date"] else None,
+        "pages": doc["page_count"],
+        "text": text,
+        "truncated": covered < len(chunks),
+        "chars_total": sum(len(c["content"]) for c in chunks),
+    }
+    if out["truncated"]:
+        out["note"] = (
+            f"Stopped after {len(text)} of {out['chars_total']} chars. "
+            f"Continue with get_context on the last shown chunk_id, or search "
+            f"this document for the specific topic."
+        )
+    return out
+
+
+@mcp.tool()
 async def get_document_info(document_id: int) -> dict[str, Any]:
-    """Full metadata for one document: title, authors, date, summary, page count."""
+    """Metadata for one document: title, authors, date, a *short summary*, page count.
+
+    The summary is a snippet of the document's beginning only — it is not the
+    document. To read the actual content use read_document.
+    """
     doc = await _db.get_document(document_id)
     if doc is None:
         return {"error": f"No document with id {document_id}"}
@@ -362,13 +414,15 @@ def main() -> int:
     _db = Database(_config)
     _embedder = Embedder(_config.embedding)
 
-    mcp.settings.host = _config.server.host
-    mcp.settings.port = _config.server.port
-    mcp.settings.streamable_http_path = _config.server.path
-
+    # mcp 2.x: transport options are run() arguments, not settings fields.
     log.info("Serving on http://%s:%d%s",
              _config.server.host, _config.server.port, _config.server.path)
-    mcp.run(transport="streamable-http")
+    mcp.run(
+        transport="streamable-http",
+        host=_config.server.host,
+        port=_config.server.port,
+        streamable_http_path=_config.server.path,
+    )
     return 0
 
 

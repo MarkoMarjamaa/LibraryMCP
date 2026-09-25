@@ -50,6 +50,13 @@ class EmbeddingConfig:
     model: str = "bge-m3"
     dimensions: int = 1024
     batch_size: int = 8
+    # llama.cpp folds every text of one /v1/embeddings request into a single
+    # physical batch, so the SUM of the request's tokens must fit the
+    # server's --ubatch-size, not just each chunk. The chunker's 4
+    # chars/token estimate is optimistic for Finnish and other inflected
+    # languages (real tokenisers land nearer 2), so cap requests well below
+    # the typical 8192 ubatch.
+    max_tokens_per_request: int = 6000
     api_key: str | None = None
     timeout: float = 120.0
 

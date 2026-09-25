@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 from typing import Any, Sequence
 
@@ -42,6 +43,47 @@ class EmbeddingServerError(RuntimeError):
 
 
 _WHITESPACE = re.compile(r"\s+")
+
+# Conservative chars/token for wire sizing. Extract.CHARS_PER_TOKEN (4)
+# measures chunk targets; this guards a hard server limit, so it must not
+# under-count. bge-m3's XGLM tokenizer lands near 2 chars/token on Finnish.
+WIRE_CHARS_PER_TOKEN = 2
+
+
+def _estimate_tokens(text: str) -> int:
+    return len(text) // WIRE_CHARS_PER_TOKEN + 1
+
+
+def _split_wire_text(text: str, limit_chars: int) -> list[str]:
+    """Break one over-long text at whitespace into pieces under limit_chars."""
+    words = text.split()
+    pieces: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for word in words:
+        extra = len(word) + (1 if cur else 0)
+        if cur and cur_len + extra > limit_chars:
+            pieces.append(" ".join(cur))
+            cur = [word]
+            cur_len = len(word)
+        else:
+            cur.append(word)
+            cur_len += extra
+    if cur:
+        pieces.append(" ".join(cur))
+    return pieces or [text[:limit_chars]]
+
+
+def _mean_vector(vectors: list[list[float]]) -> list[float]:
+    """Average piece vectors and re-normalise (bge-m3 embeddings are unit
+    length, so the mean of unit vectors only needs rescaling to unit length).
+    An average of parts approximates the whole within the pooling model."""
+    dim = len(vectors[0])
+    mean = [sum(v[d] for v in vectors) / len(vectors) for d in range(dim)]
+    norm = math.sqrt(sum(x * x for x in mean))
+    if norm > 0:
+        mean = [x / norm for x in mean]
+    return mean
 
 
 def wire_safe(text: str) -> str:
@@ -89,20 +131,36 @@ def _body_message(resp: httpx.Response) -> str:
 class Embedder:
     def __init__(self, config: EmbeddingConfig) -> None:
         self._config = config
-        headers = {}
-        if config.api_key:
-            headers["Authorization"] = f"Bearer {config.api_key}"
-        self._client = httpx.AsyncClient(
-            base_url=config.base_url.rstrip("/"),
-            timeout=httpx.Timeout(config.timeout, connect=10.0),
-            headers=headers,
-        )
         # Resolved against /v1/models at startup. None means "send no model
         # field", which is what a single-model llama-server wants.
         self._wire_model: str | None = config.model or None
+        self._client: httpx.AsyncClient | None = None
+
+    def client(self) -> httpx.AsyncClient:
+        """The HTTP client, reopened on demand if it was closed.
+
+        The client's lifetime belongs to the process, not to one MCP session.
+        Older mcp SDKs re-entered the FastMCP lifespan per streamable-HTTP
+        session, so a session ending (client DELETE, idle timeout, crash) ran
+        the lifespan teardown and closed this client while the server kept
+        serving; every later tool call then died with httpx's "Cannot send a
+        request, as the client has been closed." Reopening here makes that
+        teardown survivable regardless of SDK version.
+        """
+        if self._client is None or self._client.is_closed:
+            headers = {}
+            if self._config.api_key:
+                headers["Authorization"] = f"Bearer {self._config.api_key}"
+            self._client = httpx.AsyncClient(
+                base_url=self._config.base_url.rstrip("/"),
+                timeout=httpx.Timeout(self._config.timeout, connect=10.0),
+                headers=headers,
+            )
+        return self._client
 
     async def close(self) -> None:
-        await self._client.aclose()
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
 
     async def embed(self, texts: Sequence[str]) -> list[list[float] | None]:
         """Embed a batch. Result order matches input order.
@@ -112,6 +170,13 @@ class Embedder:
         asked to embed nothing has no result to return, and llama.cpp answers
         that with std::out_of_range rather than an error, which would abort the
         whole batch over one blank page.
+
+        llama.cpp folds every text of one request into a single physical
+        batch, so the token SUM across a request must fit the server's
+        --ubatch-size. Requests are therefore packed under both
+        `batch_size` (count) and `max_tokens_per_request` (summed estimate).
+        A single input larger than the request budget is split at whitespace
+        and its piece vectors averaged back into one.
         """
         if not texts:
             return []
@@ -126,23 +191,67 @@ class Embedder:
             )
 
         results: list[list[float] | None] = [None] * len(cleaned)
-        for start in range(0, len(sendable), self._config.batch_size):
-            idx = sendable[start : start + self._config.batch_size]
-            vectors = await self._embed_batch([cleaned[i] for i in idx])
-            for position, vector in zip(idx, vectors, strict=True):
-                results[position] = vector
+        max_tokens = self._config.max_tokens_per_request
+        limit_chars = max(max_tokens * WIRE_CHARS_PER_TOKEN, 1)
+
+        # Explode oversized inputs into (result_index, piece) units so the
+        # packer never builds a request the server will reject.
+        units: list[tuple[int, str]] = []
+        for i in sendable:
+            text = cleaned[i]
+            if _estimate_tokens(text) > max_tokens:
+                pieces = _split_wire_text(text, limit_chars)
+                log.warning(
+                    "Input ~%d tokens exceeds the %d-token request budget; "
+                    "split into %d pieces and averaging",
+                    _estimate_tokens(text), max_tokens, len(pieces),
+                )
+                units.extend((i, piece) for piece in pieces)
+            else:
+                units.append((i, text))
+
+        collected: dict[int, list[list[float]]] = {}
+        batch: list[tuple[int, str]] = []
+        batch_tokens = 0
+        for unit in units:
+            est = _estimate_tokens(unit[1])
+            if batch and (
+                len(batch) >= self._config.batch_size
+                or batch_tokens + est > max_tokens
+            ):
+                await self._embed_units(batch, collected)
+                batch = []
+                batch_tokens = 0
+            batch.append(unit)
+            batch_tokens += est
+        if batch:
+            await self._embed_units(batch, collected)
+
+        for i, vectors in collected.items():
+            results[i] = _mean_vector(vectors) if len(vectors) > 1 else vectors[0]
         return results
+
+    async def _embed_units(
+        self,
+        units: Sequence[tuple[int, str]],
+        collected: dict[int, list[list[float]]],
+    ) -> None:
+        vectors = await self._embed_batch([text for _, text in units])
+        for (index, _), vector in zip(units, vectors, strict=True):
+            collected.setdefault(index, []).append(vector)
 
     async def embed_one(self, text: str) -> list[float]:
         """Embed a single string. Raises if it has no embeddable content.
 
         Unlike batch embedding, there is nothing sensible to skip here: an
-        empty query is a caller bug, not a bad page in a PDF.
+        empty query is a caller bug, not a bad page in a PDF. Goes through
+        the same packing path so an oversized summary is split rather than
+        rejected by the server.
         """
         cleaned = wire_safe(clean_text(text))
         if not is_embeddable(cleaned):
             raise ValueError(f"Nothing embeddable in input: {text!r:.80}")
-        return (await self._embed_batch([cleaned]))[0]
+        return (await self.embed([cleaned]))[0]
 
     # -- transport ---------------------------------------------------------
 
@@ -194,7 +303,7 @@ class Embedder:
         if self._wire_model:
             payload["model"] = self._wire_model
 
-        resp = await self._client.post("/v1/embeddings", json=payload)
+        resp = await self.client().post("/v1/embeddings", json=payload)
         if resp.status_code >= 400:
             raise EmbeddingServerError(resp.status_code, _body_message(resp))
         data = resp.json()["data"]
@@ -204,7 +313,7 @@ class Embedder:
         return [item["embedding"] for item in data]
 
     async def _post_ollama(self, batch: list[str]) -> list[list[float]]:
-        resp = await self._client.post(
+        resp = await self.client().post(
             "/api/embed", json={"model": self._config.model, "input": batch}
         )
         if resp.status_code >= 400:
@@ -232,7 +341,7 @@ class Embedder:
             return
 
         try:
-            resp = await self._client.get("/v1/models")
+            resp = await self.client().get("/v1/models")
             resp.raise_for_status()
             ids = [m["id"] for m in resp.json().get("data", []) if m.get("id")]
         except (httpx.HTTPError, ValueError, KeyError) as exc:

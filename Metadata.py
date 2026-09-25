@@ -18,6 +18,7 @@ from xml.etree import ElementTree
 import httpx
 
 from Config import Shelf
+import Extract as extractmod
 import Pdf as pdfmod
 
 log = logging.getLogger(__name__)
@@ -31,7 +32,10 @@ DATE_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^(\d{4})_(\d{2})_(\d{2})"), "ymd"),
     (re.compile(r"^(\d{4})(\d{2})(\d{2})$"), "ymd"),
     (re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})"), "dmy"),   # 14.03.2026, common in FI
-    (re.compile(r"^(\d{4})-(\d{2})$"), "ym"),
+    (re.compile(r"^(\d{4})[-_](\d{2})$"), "ym"),
+    # 170630 -> 2017-06-30: yymmdd as a *prefix*, the way Finnish meeting
+    # notes are often named (170630putkiremonttikatsaus).
+    (re.compile(r"^(\d{2})(\d{2})(\d{2})(?=\D|$)"), "yymmdd"),
 )
 
 
@@ -46,7 +50,7 @@ class DocumentMeta:
 
 
 def parse_dir_date(name: str) -> dt.date | None:
-    """Directory name to date. Returns the first of the month for 'YYYY-MM'."""
+    """Directory or file name to date. 'YYYY-MM' returns the first of the month."""
     for pattern, order in DATE_PATTERNS:
         m = pattern.match(name.strip())
         if not m:
@@ -58,6 +62,12 @@ def parse_dir_date(name: str) -> dt.date | None:
                 return dt.date(int(m[3]), int(m[2]), int(m[1]))
             if order == "ym":
                 return dt.date(int(m[1]), int(m[2]), 1)
+            if order == "yymmdd":
+                # Two-digit years: 70-99 are 19xx, 00-69 are 20xx. A 19xx
+                # meeting note is unlikely, but 991231 should not become 2099.
+                yy = int(m[1])
+                year = 1900 + yy if yy >= 70 else 2000 + yy
+                return dt.date(year, int(m[2]), int(m[3]))
         except ValueError:
             return None
     return None
@@ -97,9 +107,16 @@ def _resolve_manual(path: Path, source_dir: str, pages: list[pdfmod.Page]) -> Do
 
 def _resolve_meeting(path: Path, source_dir: str, pages: list[pdfmod.Page]) -> DocumentMeta:
     date = parse_dir_date(source_dir) or parse_dir_date(path.stem)
+    # Office files carry their own title/created date; trust them over the
+    # filename when the filename says nothing (no parseable date, generic stem).
+    props = extractmod.doc_properties(path)
     title = _clean_stem(path.stem)
+    if date is None and isinstance(props.get("created"), dt.date):
+        date = props["created"]
     if date:
         title = f"{title} ({date.isoformat()})"
+    if props.get("title") and not parse_dir_date(path.stem):
+        title = props["title"]
     return DocumentMeta(
         title=title,
         doc_date=date,
@@ -107,6 +124,7 @@ def _resolve_meeting(path: Path, source_dir: str, pages: list[pdfmod.Page]) -> D
         # Replace with an LLM-generated summary if you want better recall on
         # vague queries like "what did we decide about the budget".
         summary=_first_text(pages, 1200),
+        extra={"doc_title": props["title"]} if props.get("title") else {},
     )
 
 
